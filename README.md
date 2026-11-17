@@ -1,11 +1,8 @@
 # Scalar Kalman filter in SystemVerilog
 
-For quick RTL checks before simulation, run `python3 tools/rtl_lint.py` from this
-directory. Add `--synth-check` for generic structural checks. See the
-[RTL lint guide](docs/RTL_LINT.md) for checking other modules, configuration,
-diagnostics, JSON reports, and automation.
+For quick RTL checks before simulation, run `python3 tools/rtl_lint.py` from this directory. Add `--synth-check` for generic structural checks. See the [RTL lint guide](docs/RTL_LINT.md) for checking other modules, configuration, diagnostics, JSON reports, and automation.
 
-This project implements the scalar random-walk filter in the data-flow drawing:
+This project implements the scalar random-walk filter described below: 
 
 ```text
 x_pred = x
@@ -15,9 +12,7 @@ x_next = x_pred + gain * (measurement - x_pred)
 p_next = p_pred - gain * p_pred
 ```
 
-The model has F=H=1. It estimates one unsigned sensor quantity. It does not yet
-integrate acceleration, estimate bias, fuse correlated observations, or implement
-CAN. Compile both files in `srcs/` when instantiating `kalman`.
+The model has F=H=1. It estimates one unsigned sensor quantity. It does not yet integrate acceleration, estimate bias, fuse correlated observations, or implement external interfacing. Compile both files in `srcs/` when instantiating `kalman`.
 
 ## Numeric contract
 
@@ -43,11 +38,7 @@ CAN. Compile both files in `srcs/` when instantiating `kalman`.
 - DATA_WIDTH and GAIN_FRAC_BITS must both be at least 1. The supplied regression
   requires DATA_WIDTH >= 4 for its hand-computed test vectors.
 
-Integer sensor readings do not imply that the underlying estimate or variance
-is an integer. This intentionally simple version can stall when a correction
-rounds to zero, and covariance quantization can substantially change the filter.
-The tests establish agreement with this integer contract; they do not establish
-optimal estimation performance. A later version can retain fractional state and
+Integer sensor readings do not imply that the underlying estimate or variance is an integer. This intentionally simple version can stall when a correction rounds to zero, and covariance quantization can substantially change the filter. The tests establish agreement with this integer contract; they do not establish optimal estimation performance. A later version can retain fractional state and
 covariance while keeping the sensor ports integer-valued.
 
 ## Clock, reset, and interface
@@ -164,154 +155,6 @@ The OSS CAD Suite vvp shell wrapper sets PYTHONHOME/PYTHONEXECUTABLE to its own
 bundled Python. The runner detects this wrapper and creates a project-local
 symlink to its underlying vvp executable, preserving the selected venv instead.
 It does not edit your tool installation. Plain Icarus installations are unchanged.
-
-## Walkthrough of this cocotb testbench
-
-### 1. The runner builds and starts the HDL simulator
-
-`tb/run.py` selects Icarus or Verilator with `get_runner`, lists the SystemVerilog
-sources, supplies elaboration parameters, and calls `runner.build()`. Then
-`runner.test()` starts the simulator and loads `test_kalman` or
-`test_fractional_divider` into its embedded Python runtime. Parameters are selected
-before simulation, rather than changed by driving signals.
-
-The `--matrix` option elaborates both modules at (DATA_WIDTH, GAIN_FRAC_BITS)
-values (16,16), (8,6), and (5,1). Testing a one-bit quotient fraction catches
-counter and slice boundary mistakes that default-width testing can miss.
-
-### 2. Decorated asynchronous functions are test cases
-
-In `tb/test_kalman.py`:
-
-```python
-@cocotb.test()
-async def known_half_gain_and_idle(dut):
-    driver = await setup(dut)
-    await driver.configure(q=1, r=2)
-    x, p = await driver.sample(10)
-    assert (x, p) == (5, 1)
-```
-
-`dut` is a handle to the elaborated top-level module. `dut.measurement_in.value`
-reads or drives a signal. `int(signal.value)` converts a resolved bit vector to a
-Python integer. An unresolved X/Z in a checked value causes a conversion failure
-instead of silently becoming zero. A Python assertion failure fails the test.
-
-`async`/`await` allows a test to suspend while simulation time or another event
-progresses. It is not a software delay or a separate HDL clock.
-
-### 3. Start the clock and reset the DUT
-
-`setup()` initializes every input and starts the clock concurrently:
-
-```python
-cocotb.start_soon(Clock(dut.clk, 10, unit="ns").start())
-```
-
-It then asserts synchronous reset across rising edges. Cocotb cleans up the clock
-task when the test ends. Each decorated test performs its own reset so state does
-not leak from one test into another.
-
-### 4. Drive and sample in different simulation phases
-
-The driver changes inputs at falling edges:
-
-```python
-await FallingEdge(dut.clk)
-dut.measurement_in.value = measurement
-dut.measurement_valid.value = 1
-await RisingEdge(dut.clk)
-await ReadOnly()
-```
-
-The falling edge gives inputs half a cycle to settle before the sampling edge.
-RisingEdge alone does not guarantee that the RTL's nonblocking assignments have
-completed. ReadOnly waits until signals have settled before inspecting them.
-Do not drive signals from that read-only phase; wait for a later falling edge.
-This discipline works with both event-driven Icarus and cycle-based Verilator.
-
-### 5. Separate the driver from the mathematical model
-
-`FilterDriver.configure()` writes Q/R. `sample()` accepts one transaction, waits
-with a bounded timeout, checks that the output holds while busy, and checks the
-response. It deliberately changes the measurement bus after acceptance to detect
-missing input latches. It also checks ready/valid and the documented latency.
-
-`KalmanModel.step()` in `tb/kalman_model.py` is the numerical predictor. It uses
-Python's unlimited-precision integers and direct integer division, rather than
-copying the RTL's iterative divider. It explicitly applies the specified gain
-quantization, rounding, and saturation. The expected x/p pair is the scoreboard
-entry for one accepted sample.
-
-The scoreboard compares both the output port and internal `P_k`. The covariance
-check is deliberately a small white-box check; it must be renamed if that register
-is renamed. A future externally exposed covariance/status interface could replace
-this hierarchical access.
-
-### 6. Exercise arithmetic and protocol behavior
-
-The six filter tests cover:
-
-- A hand-computed half-gain sequence, both residual signs, and idle stability.
-- Zero noise, zero predicted covariance, maximum-width inputs, and wide sums.
-- Same-edge configuration, configuration written while busy, and independent
-  Q/R write strobes.
-- Reset during an in-flight update and recovery without a stale response.
-- Continuously asserted valid, consecutive transactions, and response accounting.
-- 300 reproducible random samples with changing Q/R and a bounded-estimate check.
-
-The three divider tests cover endpoints and all ratios with denominators 1..16,
-300 random full-width ratios, input capture, latency, busy request rejection, and
-reset/recovery. The divider's oracle is Python integer division. Directed
-hand-computed filter results provide an additional check on the numerical model.
-
-There is no functional coverage collector yet. The random tests supplement the
-directed cases; they do not prove exhaustive state-space or analog-noise coverage.
-
-## Creating the next module testbench
-
-1. Write a contract: reset, legal input values, acceptance edge, response timing,
-   backpressure, configuration semantics, overflow, and exceptional cases.
-2. Add the module and its source dependencies to `tb/run.py`. Supply parameters
-   during `runner.build()` and make their values available to the Python model.
-3. Add `tb/test_<module>.py` with a reset helper and the smallest hand-checkable
-   directed case. Start the clock, drive away from the sampling edge, and read
-   after ReadOnly. Bound every wait for a response.
-4. Build a transaction-level reference model independent of the RTL algorithm.
-   Match the intended bit widths and rounding rather than comparing fixed point
-   RTL directly to unrestricted floating point results.
-5. Add boundary values, idle/busy behavior, reset during work, and configuration
-   timing. Add seeded random sequences only after the directed cases work.
-6. When more than one request can be outstanding, keep an expected-results queue
-   and use a separate monitor to compare outputs in order. The held-valid test
-   demonstrates acceptance accounting with a small `deque` scoreboard.
-7. Reproduce failures with their seed/parameters, enable waves, and inspect the
-   first mismatch. Add a directed regression case for the underlying bug.
-8. Run the suite automatically with a script or CI and preserve XML results.
-   Add meaningful coverage targets as the design grows.
-
-## Preparing for UVM later
-
-The current suite is cocotb, not SystemVerilog UVM. UVM is a separate verification
-methodology and class library standardized by IEEE 1800.2. Its familiar pieces map
-to this testbench as follows:
-
-| Current concept | Future UVM concept |
-| --- | --- |
-| Measurement/configuration operation | Sequence item (transaction) |
-| Directed or randomized sample stream | Sequence and sequencer |
-| FilterDriver signal-level methods | Driver |
-| Observing accepted inputs and valid outputs | Monitor |
-| KalmanModel plus expected-result comparisons | Predictor and scoreboard |
-| Arithmetic/protocol scenario targets | Functional coverage |
-
-For full-system verification, build reusable agents around the actual interfaces
-(CAN frames, register accesses, sensor transactions), then connect their monitors
-to a system predictor and scoreboard. Keep the mathematical model separate from
-bus timing so its vectors/specification remain reusable. A UVM regression also
-needs simulator support for the chosen SystemVerilog/UVM implementation; check
-that separately from whether a simulator supports this synthesizable RTL. The
-Python suite does not depend on installing or running UVM.
 
 ## References
 
