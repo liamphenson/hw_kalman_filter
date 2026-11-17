@@ -1,0 +1,8 @@
+.venv/
+.venv-native/
+__pycache__/
+sim_build/
+*.vcd
+*.fst
+results.xml
+lint_reports/
